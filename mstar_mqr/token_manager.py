@@ -219,16 +219,102 @@ def mark_daily_limit_exceeded() -> None:
     save_state(state)
 
 
-def _pbpaste() -> str:
-    try:
-        result = subprocess.run(["pbpaste"], check=False, capture_output=True, text=True)
-        return result.stdout or ""
-    except Exception:
-        return ""
+def _system_clipboard_text() -> str:
+    """Read the OS clipboard on macOS or Linux/X11."""
+    if shutil.which("pbpaste"):
+        try:
+            result = subprocess.run(
+                ["pbpaste"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.stdout:
+                return result.stdout
+        except Exception:
+            pass
+
+    if shutil.which("xclip") and os.environ.get("DISPLAY"):
+        try:
+            result = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-o"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.stdout:
+                return result.stdout
+        except Exception:
+            pass
+
+    return ""
+
+
+def _clear_system_clipboard() -> None:
+    """Clear stale clipboard contents before Analytics Lab copies a token."""
+    if shutil.which("pbcopy"):
+        try:
+            subprocess.run(
+                ["pbcopy"],
+                input="",
+                text=True,
+                check=False,
+                timeout=3,
+            )
+        except Exception:
+            pass
+
+    if shutil.which("xclip") and os.environ.get("DISPLAY"):
+        try:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard", "-i"],
+                input="",
+                text=True,
+                check=False,
+                timeout=3,
+            )
+        except Exception:
+            pass
 
 
 def token_from_clipboard() -> str:
-    return clean_token(_pbpaste())
+    return clean_token(_system_clipboard_text())
+
+
+def _ensure_virtual_display() -> Optional[subprocess.Popen]:
+    """Start Xvfb so hosted Linux can run normal headed Chromium."""
+    if os.environ.get("DISPLAY"):
+        return None
+
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        raise AnalyticsLabLoginError(
+            "Hosted browser needs Xvfb, but Xvfb is not installed. "
+            "Add xvfb and xclip to packages.txt."
+        )
+
+    display = os.environ.get("MSTAR_XVFB_DISPLAY", ":99")
+    proc = subprocess.Popen(
+        [
+            xvfb,
+            display,
+            "-screen",
+            "0",
+            "1440x1000x24",
+            "-ac",
+            "-nolisten",
+            "tcp",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    os.environ["DISPLAY"] = display
+    time.sleep(0.8)
+    if proc.poll() is not None:
+        raise AnalyticsLabLoginError("Could not start the hosted virtual display.")
+    return proc
 
 
 def _prompt_username_password() -> tuple[str, str]:
@@ -337,9 +423,9 @@ def _click_copy_authentication_token(page: Any) -> bool:
 def _read_browser_clipboard(page: Any, timeout_seconds: float = 5.0) -> str:
     """Read the value copied by the Analytics Lab menu command.
 
-    We try three sources because Chromium and macOS can expose clipboard data at
-    slightly different times: a writeText interceptor installed in the page,
-    navigator.clipboard.readText(), and the macOS system clipboard via pbpaste.
+    We try three sources because browsers can expose clipboard data at slightly
+    different times: page-level copy hooks, navigator.clipboard.readText(), and
+    the operating-system clipboard.
     """
     deadline = time.time() + max(0.5, float(timeout_seconds))
     while time.time() < deadline:
@@ -425,8 +511,17 @@ def _try_playwright_analytics_lab(
         return ""
 
     try:
+        virtual_display_proc: Optional[subprocess.Popen] = None
         with sync_playwright() as p:
-            launch_kwargs: Dict[str, Any] = {"headless": headless}
+            # Hosted Linux has no physical monitor. Run normal headed Chromium
+            # inside Xvfb rather than Playwright's true headless mode; this
+            # preserves ordinary clipboard behavior used by Analytics Lab.
+            browser_headless = bool(headless)
+            if os.name != "nt" and not os.environ.get("DISPLAY"):
+                virtual_display_proc = _ensure_virtual_display()
+                browser_headless = False
+
+            launch_kwargs: Dict[str, Any] = {"headless": browser_headless}
             system_chromium = (
                 os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE", "").strip()
                 or shutil.which("chromium")
@@ -435,8 +530,17 @@ def _try_playwright_analytics_lab(
             )
             if system_chromium:
                 launch_kwargs["executable_path"] = system_chromium
-            if headless:
-                launch_kwargs["args"] = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+            launch_kwargs["args"] = [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-size=1440,1000",
+            ]
+            print(
+                f"[MSTAR AUTH] chromium={system_chromium or 'playwright bundled'} "
+                f"headless={browser_headless} display={os.environ.get('DISPLAY', '')}"
+            )
             browser = p.chromium.launch(**launch_kwargs)
             context = browser.new_context()
             try:
@@ -449,26 +553,76 @@ def _try_playwright_analytics_lab(
                 context.add_init_script(
                     """
                     (() => {
-                      const install = () => {
+                      const save = (value) => {
                         try {
-                          if (!navigator.clipboard || navigator.clipboard.__mstarWrapped) return;
-                          const original = navigator.clipboard.writeText.bind(navigator.clipboard);
-                          const wrapped = async (value) => {
-                            window.__MSTAR_LAST_CLIPBOARD_TEXT = String(value || '');
-                            return original(value);
-                          };
-                          Object.defineProperty(wrapped, '__mstarWrapped', {value: true});
-                          navigator.clipboard.writeText = wrapped;
-                          navigator.clipboard.__mstarWrapped = true;
+                          const text = String(value || '').trim();
+                          if (text) window.__MSTAR_LAST_CLIPBOARD_TEXT = text;
                         } catch (_) {}
                       };
-                      install();
-                      document.addEventListener('DOMContentLoaded', install, {once: true});
+
+                      const installClipboardHook = () => {
+                        try {
+                          if (!navigator.clipboard) return;
+                          const proto = Object.getPrototypeOf(navigator.clipboard);
+                          if (!proto || proto.__mstarWrappedWriteText) return;
+                          const original = proto.writeText;
+                          if (typeof original !== 'function') return;
+                          proto.writeText = async function(value) {
+                            save(value);
+                            return original.call(this, value);
+                          };
+                          Object.defineProperty(proto, '__mstarWrappedWriteText', {value: true});
+                        } catch (_) {}
+                      };
+
+                      const installExecCommandHook = () => {
+                        try {
+                          const proto = Document.prototype;
+                          if (proto.__mstarWrappedExecCommand) return;
+                          const original = proto.execCommand;
+                          if (typeof original !== 'function') return;
+                          proto.execCommand = function(command, ...args) {
+                            if (String(command || '').toLowerCase() === 'copy') {
+                              try {
+                                const active = this.activeElement;
+                                save(active && 'value' in active ? active.value : '');
+                                save(this.getSelection ? this.getSelection().toString() : '');
+                              } catch (_) {}
+                            }
+                            return original.call(this, command, ...args);
+                          };
+                          Object.defineProperty(proto, '__mstarWrappedExecCommand', {value: true});
+                        } catch (_) {}
+                      };
+
+                      const installCopyEventHook = () => {
+                        try {
+                          document.addEventListener('copy', (event) => {
+                            try {
+                              const active = document.activeElement;
+                              save(active && 'value' in active ? active.value : '');
+                              save(window.getSelection ? window.getSelection().toString() : '');
+                              if (event.clipboardData) {
+                                save(event.clipboardData.getData('text/plain'));
+                              }
+                            } catch (_) {}
+                          }, true);
+                        } catch (_) {}
+                      };
+
+                      installClipboardHook();
+                      installExecCommandHook();
+                      installCopyEventHook();
+                      document.addEventListener('DOMContentLoaded', () => {
+                        installClipboardHook();
+                        installExecCommandHook();
+                      }, {once: true});
                     })();
                     """
                 )
             except Exception:
                 pass
+            _clear_system_clipboard()
             page = context.new_page()
             page.goto(lab_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1200)
@@ -521,9 +675,13 @@ def _try_playwright_analytics_lab(
 
                 # In JupyterLab the command is hidden under the top menu named
                 # "Analytics Lab". Open that menu first, then click the command.
-                _open_analytics_lab_token_menu(page)
+                menu_opened = _open_analytics_lab_token_menu(page)
                 if _click_copy_authentication_token(page):
                     token = _read_browser_clipboard(page) or _find_token_in_page(page)
+                    print(
+                        f"[MSTAR AUTH] menu_opened={menu_opened} copy_clicked=True "
+                        f"token_captured={bool(token)} url={page.url}"
+                    )
                     if is_jwt_shape(token):
                         browser.close()
                         return token
