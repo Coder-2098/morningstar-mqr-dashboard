@@ -1,0 +1,7 @@
+morningstar-data
+pandas
+openpyxl
+streamlit>=1.40,<2
+playwright
+requests
+supabase>=2,<3
