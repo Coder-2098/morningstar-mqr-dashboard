@@ -191,59 +191,85 @@ with st.sidebar:
 
     if _hosted_mode():
         st.caption(
-            "Hosted mode uses Morningstar's Analytics Lab token. "
-            "The token is kept only in your current browser session and is never saved to Supabase."
+            "Hosted mode logs into Morningstar Analytics Lab automatically in a "
+            "headless Chromium browser. Credentials are used only for this login "
+            "attempt and are not saved to Supabase."
         )
-        username = st.text_input(
-            "Morningstar username/email",
-            value="",
-            autocomplete="username",
-            help="Used only to build your Analytics Lab link. It is not stored.",
-        )
-        lab_url = (
-            f"https://analyticslab.morningstar.com/user/{username.strip()}/lab?"
-            if username.strip()
-            else "https://analyticslab.morningstar.com/"
-        )
-        st.link_button("Open Morningstar Analytics Lab", lab_url, use_container_width=True)
-        st.caption("In Analytics Lab choose: Analytics Lab → Copy Authentication Token.")
 
-        with st.form("hosted_token_login", clear_on_submit=False):
-            pasted_token = st.text_input(
-                "Authentication token",
-                type="password",
-                help="Paste the value copied from Analytics Lab. It is kept only for this Streamlit session.",
+        with st.form("hosted_analytics_login", clear_on_submit=False):
+            username = st.text_input(
+                "Morningstar username/email",
+                value="",
+                autocomplete="username",
             )
-            connect = st.form_submit_button("Connect / refresh token", use_container_width=True)
+            password = st.text_input(
+                "Morningstar password",
+                type="password",
+                autocomplete="current-password",
+                help="Used only for the current authentication attempt. It is not written to disk.",
+            )
+            connect = st.form_submit_button(
+                "Connect / refresh token",
+                use_container_width=True,
+            )
 
         if connect:
-            token = clean_token(pasted_token)
-            if not token:
-                st.error("Paste the Analytics Lab authentication token first.")
-            else:
-                try:
-                    with st.spinner("Verifying token with Morningstar…"):
-                        validation = validate_token_live(token)
-                    if not validation.get("valid"):
-                        raise AnalyticsLabLoginError(
-                            f"Morningstar rejected the token: {validation.get('reason', 'unknown reason')}"
-                        )
-                    st.session_state["mstar_session_token"] = token
-                    st.session_state["mstar_session_validated"] = True
-                    st.session_state["mstar_session_quota_limited"] = bool(validation.get("quota_limited"))
-                    st.success("Analytics Lab connected for this browser session.")
-                    st.rerun()
-                except Exception as exc:
-                    st.session_state["mstar_session_token"] = ""
-                    st.session_state["mstar_session_validated"] = False
-                    st.session_state["mstar_session_quota_limited"] = False
-                    st.session_state["auth_flash_error"] = str(exc)
-                    st.rerun()
+            try:
+                with st.spinner(
+                    "Logging into Analytics Lab and retrieving the authentication token…"
+                ):
+                    token = authenticate_with_credentials(
+                        username=username,
+                        password=password,
+                        use_browser=True,
+                        headless=True,
+                        timeout_seconds=180,
+                    )
+                    live_status = get_token_status()
 
-        if token_status.get("valid") and st.button("Disconnect Morningstar", use_container_width=True):
+                st.session_state["mstar_session_token"] = clean_token(token)
+                st.session_state["mstar_session_validated"] = True
+                st.session_state["mstar_session_quota_limited"] = bool(
+                    live_status.get("quota_limited", False)
+                )
+
+                # Avoid leaving a user's raw token in the shared server process.
+                os.environ.pop("MD_AUTH_TOKEN", None)
+
+                st.success(
+                    "Analytics Lab connected automatically. "
+                    "No token copy/paste is required."
+                )
+                st.rerun()
+
+            except AnalyticsLabLoginError as exc:
+                os.environ.pop("MD_AUTH_TOKEN", None)
+                st.session_state["mstar_session_token"] = ""
+                st.session_state["mstar_session_validated"] = False
+                st.session_state["mstar_session_quota_limited"] = False
+                st.session_state["auth_flash_error"] = (
+                    "Automatic Analytics Lab login failed: " + str(exc)
+                )
+                st.rerun()
+
+            except Exception as exc:
+                os.environ.pop("MD_AUTH_TOKEN", None)
+                st.session_state["mstar_session_token"] = ""
+                st.session_state["mstar_session_validated"] = False
+                st.session_state["mstar_session_quota_limited"] = False
+                st.session_state["auth_flash_error"] = (
+                    "Could not connect to Analytics Lab automatically: " + str(exc)
+                )
+                st.rerun()
+
+        if token_status.get("valid") and st.button(
+            "Disconnect Morningstar",
+            use_container_width=True,
+        ):
             st.session_state["mstar_session_token"] = ""
             st.session_state["mstar_session_validated"] = False
             st.session_state["mstar_session_quota_limited"] = False
+            os.environ.pop("MD_AUTH_TOKEN", None)
             st.rerun()
     else:
         with st.form("analytics_login", clear_on_submit=False):
