@@ -1,4 +1,4 @@
-from __future__ import annotations
+rom __future__ import annotations
 
 import contextlib
 import os
@@ -36,9 +36,12 @@ from mstar_mqr.pipeline import run_pipeline
 from mstar_mqr.token_manager import (
     AnalyticsLabLoginError,
     authenticate_with_credentials,
+    clean_token,
     get_token_status,
     invalidate_token,
     mark_daily_limit_exceeded,
+    token_expiry,
+    validate_token_live,
 )
 
 
@@ -67,6 +70,38 @@ def _apply_hosted_secrets() -> None:
 
 def _hosted_mode() -> bool:
     return os.environ.get("MSTAR_HEADLESS_AUTH", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def _hosted_token_status() -> Dict[str, Any]:
+    """Return Morningstar token status for this Streamlit browser session only."""
+    token = clean_token(st.session_state.get("mstar_session_token", ""))
+    if not token:
+        return {"valid": False, "reason": "missing", "quota_limited": False, "expires_at_utc": ""}
+
+    exp = token_expiry(token)
+    if exp is not None:
+        from datetime import datetime, timezone
+        if datetime.now(timezone.utc) >= exp:
+            st.session_state["mstar_session_token"] = ""
+            st.session_state["mstar_session_validated"] = False
+            return {
+                "valid": False,
+                "reason": "expired",
+                "quota_limited": False,
+                "expires_at_utc": exp.isoformat(),
+            }
+
+    validated = bool(st.session_state.get("mstar_session_validated", False))
+    return {
+        "valid": validated,
+        "reason": "ready" if validated else "not_live_validated",
+        "quota_limited": bool(st.session_state.get("mstar_session_quota_limited", False)),
+        "expires_at_utc": exp.isoformat() if exp else "",
+    }
+
+
+def _current_token_status() -> Dict[str, Any]:
+    return _hosted_token_status() if _hosted_mode() else get_token_status()
 
 
 _apply_hosted_secrets()
@@ -140,7 +175,7 @@ def _status_label(status: Dict[str, Any]) -> tuple[str, str]:
 
 with st.sidebar:
     st.header("Analytics Lab connection")
-    token_status = get_token_status()
+    token_status = _current_token_status()
     label, level = _status_label(token_status)
     if level == "success":
         st.success(label)
@@ -154,44 +189,101 @@ with st.sidebar:
     if token_status.get("daily_limit_reset_after_utc"):
         st.caption(f"Daily quota reset: {token_status['daily_limit_reset_after_utc']}")
 
-    with st.form("analytics_login", clear_on_submit=False):
+    if _hosted_mode():
+        st.caption(
+            "Hosted mode uses Morningstar's Analytics Lab token. "
+            "The token is kept only in your current browser session and is never saved to Supabase."
+        )
         username = st.text_input(
             "Morningstar username/email",
-            value=os.environ.get("MSTAR_USERNAME", ""),
+            value="",
             autocomplete="username",
+            help="Used only to build your Analytics Lab link. It is not stored.",
         )
-        password = st.text_input(
-            "Morningstar password",
-            type="password",
-            autocomplete="current-password",
-            help="Used only for the current authentication attempt. It is not written to disk.",
+        lab_url = (
+            f"https://analyticslab.morningstar.com/user/{username.strip()}/lab?"
+            if username.strip()
+            else "https://analyticslab.morningstar.com/"
         )
-        connect = st.form_submit_button("Connect / refresh token", use_container_width=True)
+        st.link_button("Open Morningstar Analytics Lab", lab_url, use_container_width=True)
+        st.caption("In Analytics Lab choose: Analytics Lab → Copy Authentication Token.")
 
-    if connect:
-        if _hosted_mode():
-            st.info("Connecting through the hosted server. Analytics Lab login and token capture run automatically in a headless browser.")
-        else:
-            st.info("A browser may open. Complete institutional MFA only if requested. After JupyterLab loads, the dashboard automatically opens Analytics Lab → Copy Authentication Token.")
-        try:
-            with st.spinner("Connecting to Morningstar Analytics Lab…"):
-                authenticate_with_credentials(
-                    username=username,
-                    password=password,
-                    use_browser=True,
-                    headless=_hosted_mode(),
-                    timeout_seconds=120,
-                )
-            st.success("Analytics Lab connected. No token copy/paste was required.")
+        with st.form("hosted_token_login", clear_on_submit=False):
+            pasted_token = st.text_input(
+                "Authentication token",
+                type="password",
+                help="Paste the value copied from Analytics Lab. It is kept only for this Streamlit session.",
+            )
+            connect = st.form_submit_button("Connect / refresh token", use_container_width=True)
+
+        if connect:
+            token = clean_token(pasted_token)
+            if not token:
+                st.error("Paste the Analytics Lab authentication token first.")
+            else:
+                try:
+                    with st.spinner("Verifying token with Morningstar…"):
+                        validation = validate_token_live(token)
+                    if not validation.get("valid"):
+                        raise AnalyticsLabLoginError(
+                            f"Morningstar rejected the token: {validation.get('reason', 'unknown reason')}"
+                        )
+                    st.session_state["mstar_session_token"] = token
+                    st.session_state["mstar_session_validated"] = True
+                    st.session_state["mstar_session_quota_limited"] = bool(validation.get("quota_limited"))
+                    st.success("Analytics Lab connected for this browser session.")
+                    st.rerun()
+                except Exception as exc:
+                    st.session_state["mstar_session_token"] = ""
+                    st.session_state["mstar_session_validated"] = False
+                    st.session_state["mstar_session_quota_limited"] = False
+                    st.session_state["auth_flash_error"] = str(exc)
+                    st.rerun()
+
+        if token_status.get("valid") and st.button("Disconnect Morningstar", use_container_width=True):
+            st.session_state["mstar_session_token"] = ""
+            st.session_state["mstar_session_validated"] = False
+            st.session_state["mstar_session_quota_limited"] = False
             st.rerun()
-        except AnalyticsLabLoginError as exc:
-            invalidate_token(str(exc))
-            st.session_state["auth_flash_error"] = str(exc)
-            st.rerun()
-        except Exception as exc:
-            invalidate_token(str(exc))
-            st.session_state["auth_flash_error"] = f"Could not connect to Analytics Lab: {exc}"
-            st.rerun()
+    else:
+        with st.form("analytics_login", clear_on_submit=False):
+            username = st.text_input(
+                "Morningstar username/email",
+                value=os.environ.get("MSTAR_USERNAME", ""),
+                autocomplete="username",
+            )
+            password = st.text_input(
+                "Morningstar password",
+                type="password",
+                autocomplete="current-password",
+                help="Used only for the current authentication attempt. It is not written to disk.",
+            )
+            connect = st.form_submit_button("Connect / refresh token", use_container_width=True)
+
+        if connect:
+            st.info(
+                "A browser may open. Complete institutional MFA only if requested. "
+                "After JupyterLab loads, the dashboard automatically opens Analytics Lab → Copy Authentication Token."
+            )
+            try:
+                with st.spinner("Connecting to Morningstar Analytics Lab…"):
+                    authenticate_with_credentials(
+                        username=username,
+                        password=password,
+                        use_browser=True,
+                        headless=False,
+                        timeout_seconds=120,
+                    )
+                st.success("Analytics Lab connected. No token copy/paste was required.")
+                st.rerun()
+            except AnalyticsLabLoginError as exc:
+                invalidate_token(str(exc))
+                st.session_state["auth_flash_error"] = str(exc)
+                st.rerun()
+            except Exception as exc:
+                invalidate_token(str(exc))
+                st.session_state["auth_flash_error"] = f"Could not connect to Analytics Lab: {exc}"
+                st.rerun()
 
     st.divider()
     storage = cloud_status()
@@ -389,7 +481,7 @@ with run_tab:
     run_clicked = st.button("Run / resume pipeline", type="primary", use_container_width=True)
 
     if run_clicked:
-        current_token = get_token_status()
+        current_token = _current_token_status()
         validation_errors = []
         if not current_token.get("valid"):
             validation_errors.append("Connect to Analytics Lab in the sidebar first.")
@@ -422,6 +514,10 @@ with run_tab:
             log_placeholder = st.empty()
             live_log = LiveLogBuffer(log_placeholder)
             status_box = st.status("Running Morningstar pipeline…", expanded=True)
+
+            previous_md_token = os.environ.get("MD_AUTH_TOKEN")
+            if _hosted_mode():
+                os.environ["MD_AUTH_TOKEN"] = clean_token(st.session_state.get("mstar_session_token", ""))
 
             try:
                 with contextlib.redirect_stdout(live_log), contextlib.redirect_stderr(live_log):
@@ -459,15 +555,24 @@ with run_tab:
                 st.success("Run completed. Results are available in the Progress and results tab.")
                 st.dataframe(result, use_container_width=True, hide_index=True)
             except DailyCellLimitExceeded:
-                mark_daily_limit_exceeded()
+                if _hosted_mode():
+                    st.session_state["mstar_session_quota_limited"] = True
+                    reset = ""
+                else:
+                    mark_daily_limit_exceeded()
+                    reset = get_token_status().get("daily_limit_reset_after_utc", "")
                 status_box.update(label="Daily Morningstar cell limit reached", state="error", expanded=True)
-                reset = get_token_status().get("daily_limit_reset_after_utc", "")
                 st.warning(
                     "Progress is checkpointed. After the daily reset, reconnect in the sidebar and click Run / resume again."
                     + (f" Reset recorded for: {reset}." if reset else "")
                 )
             except MorningstarAuthError as exc:
-                invalidate_token(str(exc))
+                if _hosted_mode():
+                    st.session_state["mstar_session_token"] = ""
+                    st.session_state["mstar_session_validated"] = False
+                    st.session_state["mstar_session_quota_limited"] = False
+                else:
+                    invalidate_token(str(exc))
                 status_box.update(label="Authentication failed", state="error", expanded=True)
                 st.session_state["auth_flash_error"] = (
                     f"Morningstar rejected the token: {exc}. The rejected value was cleared; reconnect in the sidebar."
@@ -478,6 +583,12 @@ with run_tab:
                 st.error(str(exc))
                 with st.expander("Technical details"):
                     st.code(traceback.format_exc(), language="text")
+            finally:
+                if _hosted_mode():
+                    if previous_md_token is None:
+                        os.environ.pop("MD_AUTH_TOKEN", None)
+                    else:
+                        os.environ["MD_AUTH_TOKEN"] = previous_md_token
 
 
 with results_tab:
